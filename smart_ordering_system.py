@@ -42,12 +42,12 @@ TRACK_MAX_DISTANCE = 90      # 前後影格人臉中心最大配對距離（像�
 TRACK_MAX_MISSED = 12        # 人臉暫時消失幾個影格後移除追蹤
 FLOW_SIDE_CONFIRM_FRAMES = 6 # 進入另一側須連續維持的影格數，避免抖動誤計
 GESTURE_HOLD_SECONDS = 1.0  # 手勢持續時間，穩定後切換到對應介紹卡
+INTRO_DURATION_SECONDS = 3.0  # 點頭確認後全畫面播放介紹的秒數
 HEAD_GESTURE_WINDOW_SECONDS = 1.1  # 點頭／搖頭動作判定時間窗
 HEAD_GESTURE_THRESHOLD = 0.12     # 鼻尖位移門檻；越低越靈敏，也越容易誤觸
 MOUTH_OPEN_THRESHOLD = 0.12       # 嘴巴張開比例門檻；降低可提高靈敏度但較易誤認
 CSV_PATH = Path(__file__).with_name("content_records.csv")
 WINDOW_NAME = "Gesture Intro Showcase | s:Save  q:Quit"
-INTRO_WINDOW_NAME = "Introduction Preview | 1-5"
 
 # 五種內容卡使用不同底色；之後可把各編號對應到實際影片檔。
 CONTENT_COLORS = {
@@ -178,7 +178,7 @@ def draw_traditional_chinese_hud(frame, lines: list[str]):
     if font_path is None:
         # 找不到中文字型時，以 OpenCV 顯示英文備援文字，避免主程式中斷。
         fallback = ["Faces", "Entered / Exited", "Customers", "Fingers",
-                    "Pending intro", "Status", "Current intro"]
+                    "Pending intro", "Status", "Current intro", "Gesture countdown"]
         for row, label in enumerate(fallback):
             cv2.putText(frame, f"{label}: {lines[row]}", (22, 70 + row * 27),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
@@ -272,8 +272,7 @@ def main() -> None:
     if not cap.isOpened():
         print(f"無法開啟攝影機（索引 {CAMERA_INDEX}）。請檢查攝影機連線或調整 CAMERA_INDEX。")
         return
-    cv2.namedWindow(INTRO_WINDOW_NAME, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(INTRO_WINDOW_NAME, 640, 360)
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 
     mp_face = mp.solutions.face_detection
     mp_face_mesh = mp.solutions.face_mesh
@@ -290,6 +289,7 @@ def main() -> None:
     candidate_confirmed = False
     pending_content: Optional[int] = None
     pending_since = 0.0
+    intro_ends_at: Optional[float] = None
     head_motion_samples = deque(maxlen=90)
     gesture_latched_until_release = False
     last_saved_event = "尚未儲存"
@@ -312,6 +312,7 @@ def main() -> None:
                 frame_index += 1
                 # 鏡像操作較符合面對鏡子的互動體驗；所有模組共用同一影像。
                 frame = cv2.flip(frame, 1)
+                camera_only_frame = frame.copy()
                 height, width = frame.shape[:2]
                 line_x = int(width * FLOW_LINE_RATIO)
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -426,12 +427,20 @@ def main() -> None:
                             current_fingers = count_raised_fingers(hand_landmarks, hand_label)
                             handedness_for_text = hand_label
                 now = time.monotonic()
+                if intro_ends_at is not None and now >= intro_ends_at:
+                    finished_content = selected_content
+                    selected_content = None
+                    intro_ends_at = None
+                    last_saved_event = (
+                        f"{finished_content} 號介紹播放完成（{INTRO_DURATION_SECONDS:.0f} 秒）"
+                    )
                 if current_fingers not in CONTENT_COLORS:
                     gesture_latched_until_release = False
                     candidate_content = None
                     candidate_since = now
                     candidate_confirmed = False
                 elif (qualified_customers > 0 and pending_content is None
+                      and intro_ends_at is None
                       and not gesture_latched_until_release):
                     if candidate_content != current_fingers:
                         candidate_content = current_fingers
@@ -462,9 +471,10 @@ def main() -> None:
 
                 if pending_content is not None and head_gesture == "nod":
                     selected_content = pending_content
+                    intro_ends_at = now + INTRO_DURATION_SECONDS
                     save_record(CSV_PATH, "點頭確認介紹", len(centers), entered, exited,
                                 current_fingers, selected_content)
-                    last_saved_event = f"點頭確認：顯示 {selected_content} 號介紹"
+                    last_saved_event = f"點頭確認：播放 {selected_content} 號介紹 {INTRO_DURATION_SECONDS:.0f} 秒"
                     pending_content = None
                     head_motion_samples.clear()
                 elif pending_content is not None and head_gesture == "shake":
@@ -483,19 +493,7 @@ def main() -> None:
                     head_motion_samples.clear()
                     last_saved_event = f"觀眾離開，取消待確認的 {cancelled_content} 號介紹"
 
-                # 繪製人臉框及信心值。
-                for detection, (x1, y1, x2, y2) in zip(face_results.detections or [], boxes):
-                    score = detection.score[0] if detection.score else 0.0
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (50, 220, 80), 2)
-                    cv2.putText(frame, f"Face {score:.2f}", (x1, max(22, y1 - 8)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (50, 220, 80), 2)
-
-                # 進出虛擬線與介面資訊。
-                cv2.line(frame, (line_x, 0), (line_x, height), (0, 210, 255), 2)
-                frame = draw_traditional_chinese_title(frame, "人臉手勢介紹展示")
-                panel = frame.copy()
-                cv2.rectangle(panel, (10, 42), (min(width - 10, 620), 260), (20, 20, 20), -1)
-                cv2.addWeighted(panel, 0.68, frame, 0.32, 0, frame)
+                # 辨識與操作狀態統一顯示在介紹預覽主畫面，不覆蓋右下角的純鏡頭影像。
                 lines = [
                     f"目前人臉數：{len(centers)}",
                     f"累計進入：{entered}　累計離開：{exited}",
@@ -505,17 +503,62 @@ def main() -> None:
                     f"紀錄狀態：{last_saved_event}",
                     f"目前介紹：{selected_content if selected_content is not None else '等待比出 1-5'}",
                 ]
-                frame = draw_traditional_chinese_hud(frame, lines)
                 preview_content = pending_content if pending_content is not None else selected_content
                 if candidate_content is not None and not candidate_confirmed:
                     remaining = max(0.0, GESTURE_HOLD_SECONDS - (now - candidate_since))
-                    cv2.putText(frame, f"Selecting #{candidate_content}: {remaining:.1f}s",
-                                (22, height - 22), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                                (0, 255, 255), 2, cv2.LINE_AA)
+                    lines.append(f"手勢選擇倒數：{remaining:.1f} 秒")
 
-                cv2.imshow(WINDOW_NAME, frame)
-                cv2.imshow(INTRO_WINDOW_NAME,
-                           make_content_preview(preview_content, pending=pending_content is not None))
+                # 介紹預覽作為主畫面；縮小辨識鏡頭後置於右下角。
+                ui_width = min(max(width, 960), 1280)
+                ui_height = int(ui_width * 9 / 16)
+                combined_frame = make_content_preview(
+                    preview_content,
+                    pending=pending_content is not None,
+                    width=ui_width,
+                    height=ui_height,
+                )
+                if intro_ends_at is None:
+                    # 介紹播放期間使用純全畫面；播放結束後恢復狀態文字與右下角鏡頭。
+                    combined_frame = draw_traditional_chinese_title(
+                        combined_frame, "人臉手勢介紹展示"
+                    )
+                    panel_bottom = min(ui_height - 110, 50 + 28 * len(lines) + 12)
+                    panel = combined_frame.copy()
+                    cv2.rectangle(panel, (10, 42), (ui_width - 10, panel_bottom), (20, 20, 20), -1)
+                    cv2.addWeighted(panel, 0.72, combined_frame, 0.28, 0, combined_frame)
+                    combined_frame = draw_traditional_chinese_hud(combined_frame, lines)
+
+                    # 右下角顯示鏡頭與必要的辨識標註，不放置整塊狀態文字面板。
+                    inset_width = int(ui_width * 0.32)
+                    inset_height = max(1, int(height * inset_width / width))
+                    inset_x = ui_width - inset_width - 20
+                    inset_y = ui_height - inset_height - 20
+                    annotated_camera = camera_only_frame.copy()
+                    for detection, (x1, y1, x2, y2) in zip(
+                            face_results.detections or [], boxes):
+                        score = detection.score[0] if detection.score else 0.0
+                        cv2.rectangle(annotated_camera, (x1, y1), (x2, y2),
+                                      (50, 220, 80), 2)
+                        cv2.putText(annotated_camera, f"Face {score:.2f}",
+                                    (x1, max(22, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX,
+                                    0.55, (50, 220, 80), 2, cv2.LINE_AA)
+                    if hand_results.multi_hand_landmarks:
+                        for hand_landmarks in hand_results.multi_hand_landmarks:
+                            mp_draw.draw_landmarks(
+                                annotated_camera, hand_landmarks, mp_hands.HAND_CONNECTIONS
+                            )
+                    small_camera = cv2.resize(annotated_camera, (inset_width, inset_height),
+                                               interpolation=cv2.INTER_AREA)
+                    small_line_x = int(line_x * inset_width / width)
+                    cv2.line(small_camera, (small_line_x, 0),
+                             (small_line_x, inset_height - 1), (0, 210, 255), 2)
+                    cv2.rectangle(combined_frame,
+                                  (inset_x - 3, inset_y - 3),
+                                  (inset_x + inset_width + 2, inset_y + inset_height + 2),
+                                  (255, 255, 255), 3)
+                    combined_frame[inset_y:inset_y + inset_height,
+                                   inset_x:inset_x + inset_width] = small_camera
+                cv2.imshow(WINDOW_NAME, combined_frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("s"):
                     save_record(CSV_PATH, "手動儲存", len(centers), entered, exited,
